@@ -1,0 +1,49 @@
+# -------------------------------
+# Python & Virtual Environments
+# -------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+.env
+
+# -------------------------------
+# Streamlit Specific
+# -------------------------------
+# Ignore Streamlit secrets (NEVER commit passwords or API keys)
+.streamlit/secrets.toml
+
+# -------------------------------
+# Data & Output Files
+# -------------------------------
+# Ignore all CSV and Excel files so you don't accidentally commit 
+# massive datasets, downloaded exchange filings, or user uploads.
+*.csv
+*.xlsx
+*.xls
+
+# If you want to keep an empty data folder structure, uncomment the line below
+# !data/.gitkeep
+
+# -------------------------------
+# OS & IDE Files
+# -------------------------------
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Mac
+.DS_Store
+
+# IDEs (VS Code, PyCharm, etc.)
+.vscode/
+.idea/
+*.swp
+
+# -------------------------------
+# Logs and Caches
+# -------------------------------
+*.log
+.pytest_cache/
