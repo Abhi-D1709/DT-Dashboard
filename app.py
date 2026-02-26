@@ -8,6 +8,7 @@ import io
 import random
 from datetime import datetime, timedelta, date
 from typing import Dict, Any, Tuple, List, Optional
+import concurrent.futures
 
 # -------------------------------
 # Page Config
@@ -298,93 +299,74 @@ def get_due_date(period: str, fin_year_start: int, check_category: str) -> str:
         return "Manual Review"
 
 def get_date_chunks(start_date: date, end_date: date, chunk_days: int = 90) -> List[Tuple[date, date]]:
-    """Breaks a large date range into smaller, API-safe chunks (e.g., 90 days)."""
+    """Breaks a large date range into API-safe chunks."""
     chunks = []
     current_start = start_date
     while current_start <= end_date:
         current_end = current_start + timedelta(days=chunk_days - 1)
-        if current_end > end_date:
-            current_end = end_date
+        if current_end > end_date: current_end = end_date
         chunks.append((current_start, current_end))
         current_start = current_end + timedelta(days=1)
     return chunks
 
 # -------------------------------
-# Main fetch: NSE + BSE (Upgraded with Date Chunking)
+# Main fetch: Pure 1-to-1 Fetcher
 # -------------------------------
 def fetch_disclosures_for_isin(isin_data: Dict[str, Any], from_dt: date, to_dt: date, dt_name_global: str) -> Tuple[pd.DataFrame, List[str]]:
     errors, records = [], []
     
-    # Break the requested dates into safe 90-day chunks to bypass Exchange limits
-    date_chunks = get_date_chunks(from_dt, to_dt, chunk_days=90)
-    
+    # 1. BSE Fetch
     bse_scrip = isin_data.get("BSE_Scrip")
-    nse_session = make_nse_session() # Re-use one session for all NSE chunks
-
-    for chunk_start, chunk_end in date_chunks:
-        # ---- 1. BSE Fetch for this chunk ----
-        if bse_scrip:
-            bse_from, bse_to = chunk_start.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")
-            bse_url = f"https://api.bseindia.com/BseIndiaAPI/api/DisclosureDT/w?fromdt={bse_from}&scripcode={bse_scrip}&todt={bse_to}"
-            s = requests.Session()
-            bse_json, bse_err = request_json_with_retries(s, bse_url, headers=BSE_HEADERS, timeout=15)
-            
-            if bse_json is None: 
-                errors.append(f"[BSE {bse_from}-{bse_to}] {bse_err}")
-            else:
-                for item in bse_json.get("Table", []):
-                    try: sub_date = datetime.strptime(str(item.get("InsDttm", ""))[:10], "%Y-%m-%d")
-                    except Exception: continue
-                    
-                    fy_raw = item.get("Financial_year")
-                    fy_start = int(str(fy_raw)[:4]) if fy_raw else sub_date.year
-                    period, raw_text, doc_link = str(item.get("period", "")).strip(), str(item.get("Body_text", "")).strip(), str(item.get("pdf_name", "")).strip()
-                    category = classify_disclosure(raw_text)
-                    due_date_str = get_due_date(period, fy_start, category)
-                    status = "Manual Review Required" if due_date_str == "Manual Review" else ("On Time" if sub_date <= datetime.strptime(due_date_str, "%Y-%m-%d") else "Delayed")
-
-                    records.append({
-                        "ISIN": isin_data.get("ISIN"), "Entity": isin_data.get("Name", "Unknown"), "Exchange": "BSE", "Debenture Trustee": dt_name_global,
-                        "Check Category": category, "Raw Disclosure Name": raw_text, "Period/FY": f"{period} {fy_start}",
-                        "Submission Date": sub_date.strftime("%Y-%m-%d"), "Calculated Due Date": due_date_str, "Compliance Status": status, "Document Link": doc_link,
-                    })
-
-        # ---- 2. NSE Fetch for this chunk ----
-        nse_from, nse_to = chunk_start.strftime("%d-%m-%Y"), chunk_end.strftime("%d-%m-%Y")
-        nse_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getDTDisclosures&comp_name=&dt_name=&ISIN={isin_data.get('ISIN','')}&subject=&from_date={nse_from}&to_date={nse_to}"
-
-        nse_json, nse_err = request_json_with_retries(nse_session, nse_url, headers=HEADERS, timeout=15)
-        if nse_json is None: 
-            errors.append(f"[NSE {nse_from}-{nse_to}] {nse_err}")
+    if bse_scrip:
+        bse_from, bse_to = from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")
+        bse_url = f"https://api.bseindia.com/BseIndiaAPI/api/DisclosureDT/w?fromdt={bse_from}&scripcode={bse_scrip}&todt={bse_to}"
+        s = requests.Session()
+        bse_json, bse_err = request_json_with_retries(s, bse_url, headers=BSE_HEADERS, timeout=15)
+        if bse_json is None: errors.append(f"[BSE {bse_from}-{bse_to}] {bse_err}")
         else:
-            for item in nse_json:
-                try: sub_date = datetime.strptime(item.get("exchdissTime", ""), "%d-%b-%Y %H:%M:%S")
-                except Exception:
-                    try: sub_date = datetime.strptime(item.get("dt", ""), "%d-%b-%Y %H:%M:%S")
-                    except Exception: continue
-
-                raw_text, broad_text, doc_link = str(item.get("desc", "")).strip(), str(item.get("broadText", "")).strip(), str(item.get("attchmntName", "")).strip()
-                period, fy_start = extract_nse_period_fy(f"{raw_text} {broad_text}", sub_date.year)
+            for item in bse_json.get("Table", []):
+                try: sub_date = datetime.strptime(str(item.get("InsDttm", ""))[:10], "%Y-%m-%d")
+                except Exception: continue
+                fy_raw = item.get("Financial_year")
+                fy_start = int(str(fy_raw)[:4]) if fy_raw else sub_date.year
+                period, raw_text, doc_link = str(item.get("period", "")).strip(), str(item.get("Body_text", "")).strip(), str(item.get("pdf_name", "")).strip()
                 category = classify_disclosure(raw_text)
                 due_date_str = get_due_date(period, fy_start, category)
                 status = "Manual Review Required" if due_date_str == "Manual Review" else ("On Time" if sub_date <= datetime.strptime(due_date_str, "%Y-%m-%d") else "Delayed")
 
                 records.append({
-                    "ISIN": isin_data.get("ISIN"), "Entity": isin_data.get("Name", "Unknown"), "Exchange": "NSE", "Debenture Trustee": dt_name_global,
-                    "Check Category": category, "Raw Disclosure Name": raw_text, "Period/FY": f"{period} {fy_start}" if period != "Unknown" else "Check Text",
+                    "ISIN": isin_data.get("ISIN"), "Entity": isin_data.get("Name", "Unknown"), "Exchange": "BSE", "Debenture Trustee": dt_name_global,
+                    "Check Category": category, "Raw Disclosure Name": raw_text, "Period/FY": f"{period} {fy_start}",
                     "Submission Date": sub_date.strftime("%Y-%m-%d"), "Calculated Due Date": due_date_str, "Compliance Status": status, "Document Link": doc_link,
                 })
-                
-        # Give the servers a tiny breather between chunks
-        time.sleep(0.1)
 
-    # Because we stitched multiple chunks together, we might get duplicates if the exchanges have overlap.
-    # This safely removes any exact duplicate rows before returning the final table.
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["Exchange", "Raw Disclosure Name", "Submission Date", "Document Link"])
-        
-    return df, errors
+    # 2. NSE Fetch
+    nse_session = make_nse_session()
+    nse_from, nse_to = from_dt.strftime("%d-%m-%Y"), to_dt.strftime("%d-%m-%Y")
+    nse_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getDTDisclosures&comp_name=&dt_name=&ISIN={isin_data.get('ISIN','')}&subject=&from_date={nse_from}&to_date={nse_to}"
+
+    nse_json, nse_err = request_json_with_retries(nse_session, nse_url, headers=HEADERS, timeout=15)
+    if nse_json is None: errors.append(f"[NSE {nse_from}-{nse_to}] {nse_err}")
+    else:
+        for item in nse_json:
+            try: sub_date = datetime.strptime(item.get("exchdissTime", ""), "%d-%b-%Y %H:%M:%S")
+            except Exception:
+                try: sub_date = datetime.strptime(item.get("dt", ""), "%d-%b-%Y %H:%M:%S")
+                except Exception: continue
+
+            raw_text, broad_text, doc_link = str(item.get("desc", "")).strip(), str(item.get("broadText", "")).strip(), str(item.get("attchmntName", "")).strip()
+            period, fy_start = extract_nse_period_fy(f"{raw_text} {broad_text}", sub_date.year)
+            category = classify_disclosure(raw_text)
+            due_date_str = get_due_date(period, fy_start, category)
+            status = "Manual Review Required" if due_date_str == "Manual Review" else ("On Time" if sub_date <= datetime.strptime(due_date_str, "%Y-%m-%d") else "Delayed")
+
+            records.append({
+                "ISIN": isin_data.get("ISIN"), "Entity": isin_data.get("Name", "Unknown"), "Exchange": "NSE", "Debenture Trustee": dt_name_global,
+                "Check Category": category, "Raw Disclosure Name": raw_text, "Period/FY": f"{period} {fy_start}" if period != "Unknown" else "Check Text",
+                "Submission Date": sub_date.strftime("%Y-%m-%d"), "Calculated Due Date": due_date_str, "Compliance Status": status, "Document Link": doc_link,
+            })
+
+    return pd.DataFrame(records), errors
 
 # -------------------------------
 # Checklist builder (per ISIN)
@@ -497,9 +479,6 @@ if start_date > end_date:
 # -------------------------------
 # Single ISIN
 # -------------------------------
-# -------------------------------
-# Single ISIN
-# -------------------------------
 if mode == "Single ISIN Search":
     isin_options = list(master_isins.keys())
     selected_isin = st.sidebar.selectbox(
@@ -558,125 +537,122 @@ if mode == "Single ISIN Search":
                     st.write(e)
 
 # -------------------------------
-# Bulk upload (SEQUENTIAL ONLY)
-# -------------------------------
-# -------------------------------
-# Bulk upload (SEQUENTIAL ONLY)
+# Bulk Upload View (Maximum Concurrency)
 # -------------------------------
 elif mode == "Bulk Excel Upload":
-    st.sidebar.info("Upload an Excel/CSV. The app reads the **first column** as ISINs and runs sequentially.")
-    uploaded_file = st.sidebar.file_uploader("Upload Excel File (.xlsx/.xls/.csv)", type=["xlsx", "xls", "csv"])
+    st.sidebar.markdown("### Batch Processing")
+    st.sidebar.caption("Warning: Extreme multithreading enabled. IP bans possible.")
+    uploaded_file = st.sidebar.file_uploader("Upload Target List", type=["xlsx", "xls", "csv"])
 
-    if uploaded_file and st.sidebar.button("Run Bulk Analysis"):
+    if uploaded_file and st.sidebar.button("Execute Bulk Audit", type="primary"):
         try:
-            if uploaded_file.name.lower().endswith(".csv"):
-                df_upload = pd.read_csv(uploaded_file)
-            else:
-                df_upload = pd.read_excel(uploaded_file)
+            if uploaded_file.name.lower().endswith(".csv"): df_upload = pd.read_csv(uploaded_file)
+            else: df_upload = pd.read_excel(uploaded_file)
 
             raw_isins = df_upload.iloc[:, 0].dropna().astype(str).tolist()
             unique_isins = normalize_isin_list(raw_isins)
 
             if len(unique_isins) == 0:
-                st.error("No ISINs found in the first column.")
+                st.sidebar.error("No valid ISINs detected.")
                 st.stop()
-
+                
             if len(unique_isins) > 50:
-                st.warning(f"File contains {len(unique_isins)} ISINs. Processing only the first 50.")
+                st.sidebar.warning(f"File truncated. Processing first 50 of {len(unique_isins)} ISINs.")
                 unique_isins = unique_isins[:50]
 
-            st.success(f"Processing {len(unique_isins)} ISIN(s) sequentially.")
-
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
-
-            all_disclosures = []
-            all_checklists = []
-            debug_rows = []
-
-            completed = 0
+            # 1. Flatten the Workload (ISINs x Date Chunks = Total Tasks)
+            all_tasks = []
+            isin_dt_map = {}
+            
+            with st.spinner("Pre-fetching NSDL Trustee data to avoid hammering their API..."):
+                for isin in unique_isins:
+                    isin_dt_map[isin] = get_dt_name_from_nsdl(isin)
+                    
+            date_chunks = get_date_chunks(start_date, end_date, 90)
             for isin in unique_isins:
                 isin_data = master_isins.get(isin, {"ISIN": isin, "Name": "Unknown Entity", "BSE_Scrip": None, "NSE_Symbol": None})
-                dt_name = get_dt_name_from_nsdl(isin)
+                for c_start, c_end in date_chunks:
+                    all_tasks.append((isin, isin_data, isin_dt_map[isin], c_start, c_end))
 
-                time.sleep(1.0) # polite delay
+            st.warning(f"🚨 Firing {len(all_tasks)} simultaneous API requests across {len(unique_isins)} ISINs...")
 
-                df_disc, errs = fetch_disclosures_for_isin(isin_data, start_date, end_date, dt_name)
-                df_check = build_checklist_for_isin(isin, isin_data, df_disc)
+            # 2. Fire the Thread Pool
+            raw_results = {isin: [] for isin in unique_isins}
+            debug_errs = {isin: [] for isin in unique_isins}
+            
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            
+            def worker(task):
+                isin, isin_data, dt_name, c_start, c_end = task
+                time.sleep(random.uniform(0.1, 0.5)) # Micro-jitter to prevent immediate WAF triggers
+                df, errs = fetch_disclosures_for_isin(isin_data, c_start, c_end, dt_name)
+                return isin, df, errs
 
-                if not df_disc.empty:
-                    all_disclosures.append(df_disc)
-                if not df_check.empty:
-                    all_checklists.append(df_check)
-
-                debug_rows.append({
-                    "ISIN": isin, "Entity": isin_data.get("Name", "Unknown"),
-                    "Errors": " | ".join(errs) if errs else "",
-                    "Disclosures Found": int(len(df_disc)),
-                })
-
-                completed += 1
-                progress_bar.progress(completed / len(unique_isins))
-                status_text.text(f"Processed {completed}/{len(unique_isins)} ISINs...")
-
+            completed = 0
+            # max_workers=20 means 20 requests hitting BSE/NSE at the exact same time
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                futures = {executor.submit(worker, t): t for t in all_tasks}
+                for future in concurrent.futures.as_completed(futures):
+                    isin, df, errs = future.result()
+                    if not df.empty: raw_results[isin].append(df)
+                    if errs: debug_errs[isin].extend(errs)
+                        
+                    completed += 1
+                    progress_bar.progress(completed / len(all_tasks))
+                    status_text.text(f"API Blast Progress: {completed}/{len(all_tasks)} chunks processed...")
+                    
             progress_bar.empty()
             status_text.empty()
             
-            # Aggregate Results
-            final_checklists_df = pd.concat(all_checklists, ignore_index=True) if all_checklists else pd.DataFrame()
-            final_bulk_df = pd.concat(all_disclosures, ignore_index=True) if all_disclosures else pd.DataFrame()
-            debug_df = pd.DataFrame(debug_rows).sort_values(by="Disclosures Found", ascending=True)
+            # 3. Stitch Everything Back Together
+            all_disclosures, all_checklists, debug_rows = [], [], []
+            for isin in unique_isins:
+                dfs = raw_results[isin]
+                isin_data = master_isins.get(isin, {"ISIN": isin, "Name": "Unknown Entity", "BSE_Scrip": None, "NSE_Symbol": None})
+                
+                if dfs:
+                    combined_df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["Exchange", "Raw Disclosure Name", "Submission Date", "Document Link"])
+                    all_disclosures.append(combined_df)
+                    all_checklists.append(build_checklist_for_isin(isin, isin_data, combined_df))
+                else:
+                    all_checklists.append(build_checklist_for_isin(isin, isin_data, pd.DataFrame()))
+                    
+                debug_rows.append({"ISIN": isin, "Entity": isin_data.get("Name", "Unknown"), "Errors": " | ".join(debug_errs[isin]) if debug_errs[isin] else "None", "Found": int(len(combined_df)) if dfs else 0})
 
-            # Save to Session State
+            # Save to session state
             st.session_state.bulk_results = {
-                "checklists": final_checklists_df,
-                "disclosures": final_bulk_df,
-                "debug": debug_df,
+                "checklists": pd.concat(all_checklists, ignore_index=True) if all_checklists else pd.DataFrame(),
+                "disclosures": pd.concat(all_disclosures, ignore_index=True) if all_disclosures else pd.DataFrame(),
+                "debug": pd.DataFrame(debug_rows).sort_values(by="Found", ascending=True),
                 "count": len(unique_isins)
             }
-            st.session_state.single_results = None # Clear single search state
+            st.session_state.single_results = None 
             
         except Exception as e:
-            st.error(f"Failed to process the uploaded file: {e}")
+            st.error(f"Processing failed: {e}")
 
     # Render UI from Session State
     if st.session_state.bulk_results and mode == "Bulk Excel Upload":
         res = st.session_state.bulk_results
         
-        st.subheader("📊 Bulk Processing Results")
+        m1, m2 = st.columns(2)
+        m1.metric("Batch Size Processed", res['count'])
+        m2.metric("Total Submissions Found", len(res['disclosures']))
+        st.markdown("<br>", unsafe_allow_html=True)
 
         if not res['checklists'].empty:
-            st.markdown("### 1) Master Compliance Checklist (Gap Analysis)")
+            st.subheader("📋 Master Gap Analysis Checklist")
             st.dataframe(res['checklists'].style.map(highlight_status, subset=["Status"]), use_container_width=True)
-
             csv_check = res['checklists'].to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download Master Checklist CSV",
-                data=csv_check,
-                file_name=f"Bulk_Master_Checklist_{start_date}_to_{end_date}.csv",
-                mime="text/csv",
-            )
+            st.download_button("📥 Export Gap Analysis (CSV)", data=csv_check, file_name=f"Bulk_Gap_Analysis_{start_date}_to_{end_date}.csv", mime="text/csv", type="primary")
             st.markdown("---")
 
         if not res['disclosures'].empty:
-            st.markdown("### 2) Raw Disclosures Found")
-            st.metric("Total Actual Disclosures Found", len(res['disclosures']))
-
-            st.dataframe(
-                res['disclosures'].drop(columns=["Check Category"], errors="ignore"),
-                use_container_width=True,
-                column_config={"Document Link": st.column_config.LinkColumn("Document Link", display_text="Open PDF")},
-            )
-
+            st.subheader("📁 Aggregated Filings Database")
+            st.dataframe(res['disclosures'].drop(columns=["Check Category"], errors="ignore"), use_container_width=True, column_config={"Document Link": st.column_config.LinkColumn("Document Link", display_text="View PDF")})
             csv_raw = res['disclosures'].to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download Raw Disclosures CSV",
-                data=csv_raw,
-                file_name=f"Bulk_Raw_Disclosures_{start_date}_to_{end_date}.csv",
-                mime="text/csv",
-            )
-        else:
-            st.warning("No disclosures found for any ISIN in this date range.")
+            st.download_button("📥 Export Filings Database (CSV)", data=csv_raw, file_name=f"Bulk_Filings_{start_date}_to_{end_date}.csv", mime="text/csv", type="secondary")
 
-        with st.expander("Debug: per-ISIN fetch status"):
+        with st.expander("System Logs & Errors (Check here for WAF Bans)"):
             st.dataframe(res['debug'], use_container_width=True)
