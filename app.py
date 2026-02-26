@@ -297,134 +297,94 @@ def get_due_date(period: str, fin_year_start: int, check_category: str) -> str:
     except Exception:
         return "Manual Review"
 
+def get_date_chunks(start_date: date, end_date: date, chunk_days: int = 90) -> List[Tuple[date, date]]:
+    """Breaks a large date range into smaller, API-safe chunks (e.g., 90 days)."""
+    chunks = []
+    current_start = start_date
+    while current_start <= end_date:
+        current_end = current_start + timedelta(days=chunk_days - 1)
+        if current_end > end_date:
+            current_end = end_date
+        chunks.append((current_start, current_end))
+        current_start = current_end + timedelta(days=1)
+    return chunks
 
 # -------------------------------
-# Main fetch: NSE + BSE
+# Main fetch: NSE + BSE (Upgraded with Date Chunking)
 # -------------------------------
-def fetch_disclosures_for_isin(
-    isin_data: Dict[str, Any],
-    from_dt: date,
-    to_dt: date,
-    dt_name_global: str,
-) -> Tuple[pd.DataFrame, List[str]]:
-    errors: List[str] = []
-    records: List[Dict[str, Any]] = []
-
-    # ---- BSE fetch (by scrip)
+def fetch_disclosures_for_isin(isin_data: Dict[str, Any], from_dt: date, to_dt: date, dt_name_global: str) -> Tuple[pd.DataFrame, List[str]]:
+    errors, records = [], []
+    
+    # Break the requested dates into safe 90-day chunks to bypass Exchange limits
+    date_chunks = get_date_chunks(from_dt, to_dt, chunk_days=90)
+    
     bse_scrip = isin_data.get("BSE_Scrip")
-    if bse_scrip:
-        bse_from = from_dt.strftime("%Y%m%d")
-        bse_to = to_dt.strftime("%Y%m%d")
-        bse_url = f"https://api.bseindia.com/BseIndiaAPI/api/DisclosureDT/w?fromdt={bse_from}&scripcode={bse_scrip}&todt={bse_to}"
-        s = requests.Session()
-        bse_json, bse_err = request_json_with_retries(s, bse_url, headers=BSE_HEADERS, timeout=15)
-        if bse_json is None:
-            errors.append(f"[BSE] {bse_err}")
+    nse_session = make_nse_session() # Re-use one session for all NSE chunks
+
+    for chunk_start, chunk_end in date_chunks:
+        # ---- 1. BSE Fetch for this chunk ----
+        if bse_scrip:
+            bse_from, bse_to = chunk_start.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")
+            bse_url = f"https://api.bseindia.com/BseIndiaAPI/api/DisclosureDT/w?fromdt={bse_from}&scripcode={bse_scrip}&todt={bse_to}"
+            s = requests.Session()
+            bse_json, bse_err = request_json_with_retries(s, bse_url, headers=BSE_HEADERS, timeout=15)
+            
+            if bse_json is None: 
+                errors.append(f"[BSE {bse_from}-{bse_to}] {bse_err}")
+            else:
+                for item in bse_json.get("Table", []):
+                    try: sub_date = datetime.strptime(str(item.get("InsDttm", ""))[:10], "%Y-%m-%d")
+                    except Exception: continue
+                    
+                    fy_raw = item.get("Financial_year")
+                    fy_start = int(str(fy_raw)[:4]) if fy_raw else sub_date.year
+                    period, raw_text, doc_link = str(item.get("period", "")).strip(), str(item.get("Body_text", "")).strip(), str(item.get("pdf_name", "")).strip()
+                    category = classify_disclosure(raw_text)
+                    due_date_str = get_due_date(period, fy_start, category)
+                    status = "Manual Review Required" if due_date_str == "Manual Review" else ("On Time" if sub_date <= datetime.strptime(due_date_str, "%Y-%m-%d") else "Delayed")
+
+                    records.append({
+                        "ISIN": isin_data.get("ISIN"), "Entity": isin_data.get("Name", "Unknown"), "Exchange": "BSE", "Debenture Trustee": dt_name_global,
+                        "Check Category": category, "Raw Disclosure Name": raw_text, "Period/FY": f"{period} {fy_start}",
+                        "Submission Date": sub_date.strftime("%Y-%m-%d"), "Calculated Due Date": due_date_str, "Compliance Status": status, "Document Link": doc_link,
+                    })
+
+        # ---- 2. NSE Fetch for this chunk ----
+        nse_from, nse_to = chunk_start.strftime("%d-%m-%Y"), chunk_end.strftime("%d-%m-%Y")
+        nse_url = f"https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getDTDisclosures&comp_name=&dt_name=&ISIN={isin_data.get('ISIN','')}&subject=&from_date={nse_from}&to_date={nse_to}"
+
+        nse_json, nse_err = request_json_with_retries(nse_session, nse_url, headers=HEADERS, timeout=15)
+        if nse_json is None: 
+            errors.append(f"[NSE {nse_from}-{nse_to}] {nse_err}")
         else:
-            table = bse_json.get("Table", [])
-            for item in table:
-                try:
-                    sub_date = datetime.strptime(str(item.get("InsDttm", ""))[:10], "%Y-%m-%d")
+            for item in nse_json:
+                try: sub_date = datetime.strptime(item.get("exchdissTime", ""), "%d-%b-%Y %H:%M:%S")
                 except Exception:
-                    continue
+                    try: sub_date = datetime.strptime(item.get("dt", ""), "%d-%b-%Y %H:%M:%S")
+                    except Exception: continue
 
-                fy_raw = item.get("Financial_year")
-                if fy_raw:
-                    try:
-                        fy_start = int(str(fy_raw)[:4])
-                    except Exception:
-                        fy_start = sub_date.year
-                else:
-                    fy_start = sub_date.year
-
-                period = str(item.get("period", "")).strip()
-                raw_text = str(item.get("Body_text", "")).strip()
-                doc_link = str(item.get("pdf_name", "")).strip()
-
+                raw_text, broad_text, doc_link = str(item.get("desc", "")).strip(), str(item.get("broadText", "")).strip(), str(item.get("attchmntName", "")).strip()
+                period, fy_start = extract_nse_period_fy(f"{raw_text} {broad_text}", sub_date.year)
                 category = classify_disclosure(raw_text)
                 due_date_str = get_due_date(period, fy_start, category)
-
-                if due_date_str == "Manual Review":
-                    status = "Manual Review Required"
-                else:
-                    try:
-                        status = "On Time" if sub_date <= datetime.strptime(due_date_str, "%Y-%m-%d") else "Delayed"
-                    except Exception:
-                        status = "Manual Review Required"
+                status = "Manual Review Required" if due_date_str == "Manual Review" else ("On Time" if sub_date <= datetime.strptime(due_date_str, "%Y-%m-%d") else "Delayed")
 
                 records.append({
-                    "ISIN": isin_data.get("ISIN"),
-                    "Entity": isin_data.get("Name", "Unknown"),
-                    "Exchange": "BSE",
-                    "Debenture Trustee": dt_name_global,
-                    "Check Category": category,
-                    "Raw Disclosure Name": raw_text,
-                    "Period/FY": f"{period} {fy_start}",
-                    "Submission Date": sub_date.strftime("%Y-%m-%d"),
-                    "Calculated Due Date": due_date_str,
-                    "Compliance Status": status,
-                    "Document Link": doc_link,
+                    "ISIN": isin_data.get("ISIN"), "Entity": isin_data.get("Name", "Unknown"), "Exchange": "NSE", "Debenture Trustee": dt_name_global,
+                    "Check Category": category, "Raw Disclosure Name": raw_text, "Period/FY": f"{period} {fy_start}" if period != "Unknown" else "Check Text",
+                    "Submission Date": sub_date.strftime("%Y-%m-%d"), "Calculated Due Date": due_date_str, "Compliance Status": status, "Document Link": doc_link,
                 })
+                
+        # Give the servers a tiny breather between chunks
+        time.sleep(0.1)
 
-    # ---- NSE fetch (by ISIN)
-    nse_session = make_nse_session()
-
-    nse_from = from_dt.strftime("%d-%m-%Y")
-    nse_to = to_dt.strftime("%d-%m-%Y")
-    nse_url = (
-        "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
-        f"?functionName=getDTDisclosures&comp_name=&dt_name=&ISIN={isin_data.get('ISIN','')}"
-        f"&subject=&from_date={nse_from}&to_date={nse_to}"
-    )
-
-    nse_json, nse_err = request_json_with_retries(nse_session, nse_url, headers=HEADERS, timeout=15)
-    if nse_json is None:
-        errors.append(f"[NSE] {nse_err}")
-    else:
-        for item in nse_json:
-            try:
-                sub_date = datetime.strptime(item.get("exchdissTime", ""), "%d-%b-%Y %H:%M:%S")
-            except Exception:
-                try:
-                    sub_date = datetime.strptime(item.get("dt", ""), "%d-%b-%Y %H:%M:%S")
-                except Exception:
-                    continue
-
-            raw_text = str(item.get("desc", "")).strip()
-            broad_text = str(item.get("broadText", "")).strip()
-            doc_link = str(item.get("attchmntName", "")).strip()
-
-            combined_text = f"{raw_text} {broad_text}"
-            period, fy_start = extract_nse_period_fy(combined_text, sub_date.year)
-
-            category = classify_disclosure(raw_text)
-            due_date_str = get_due_date(period, fy_start, category)
-
-            if due_date_str == "Manual Review":
-                status = "Manual Review Required"
-            else:
-                try:
-                    status = "On Time" if sub_date <= datetime.strptime(due_date_str, "%Y-%m-%d") else "Delayed"
-                except Exception:
-                    status = "Manual Review Required"
-
-            records.append({
-                "ISIN": isin_data.get("ISIN"),
-                "Entity": isin_data.get("Name", "Unknown"),
-                "Exchange": "NSE",
-                "Debenture Trustee": dt_name_global,
-                "Check Category": category,
-                "Raw Disclosure Name": raw_text,
-                "Period/FY": f"{period} {fy_start}" if period != "Unknown" else "Check Text",
-                "Submission Date": sub_date.strftime("%Y-%m-%d"),
-                "Calculated Due Date": due_date_str,
-                "Compliance Status": status,
-                "Document Link": doc_link,
-            })
-
+    # Because we stitched multiple chunks together, we might get duplicates if the exchanges have overlap.
+    # This safely removes any exact duplicate rows before returning the final table.
     df = pd.DataFrame(records)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["Exchange", "Raw Disclosure Name", "Submission Date", "Document Link"])
+        
     return df, errors
-
 
 # -------------------------------
 # Checklist builder (per ISIN)
